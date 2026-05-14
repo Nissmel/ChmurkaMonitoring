@@ -1,5 +1,4 @@
 #include <Wire.h>
-#include <DHT.h>
 #include <U8g2lib.h>
 
 
@@ -7,10 +6,63 @@
 U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
 
-// DHT Sensor Configuration (Interior only)
-#define DHT_PIN1 2
-#define DHT_TYPE DHT22
-DHT dht1(DHT_PIN1, DHT_TYPE);
+// DHT22 Sensor - manual bit-bang (no library needed, more reliable)
+#define DHT_PIN 2
+uint8_t dhtData[5];  // raw bytes from sensor
+
+// Read DHT22 manually - returns true on success
+// failStep: 0=ok, 1=no response, 2=ack LOW, 3=ack HIGH, 4=bit timeout, 5=checksum
+uint8_t dhtFailStep = 0;
+
+bool readDHT() {
+  uint8_t bits[5] = {0};
+  dhtFailStep = 0;
+
+  // Send start signal: pull LOW for 1ms (DHT22 needs only 1ms, 20ms also works)
+  pinMode(DHT_PIN, OUTPUT);
+  digitalWrite(DHT_PIN, LOW);
+  delay(2);
+  digitalWrite(DHT_PIN, HIGH);
+  delayMicroseconds(40);
+  pinMode(DHT_PIN, INPUT_PULLUP);
+
+  noInterrupts();
+
+  uint16_t loopCnt;
+
+  loopCnt = 10000;
+  while (digitalRead(DHT_PIN) == HIGH) { if (--loopCnt == 0) { interrupts(); dhtFailStep = 1; return false; } }
+  loopCnt = 10000;
+  while (digitalRead(DHT_PIN) == LOW)  { if (--loopCnt == 0) { interrupts(); dhtFailStep = 2; return false; } }
+  loopCnt = 10000;
+  while (digitalRead(DHT_PIN) == HIGH) { if (--loopCnt == 0) { interrupts(); dhtFailStep = 3; return false; } }
+
+  // Read 40 bits (5 bytes)
+  for (uint8_t i = 0; i < 40; i++) {
+    loopCnt = 10000;
+    while (digitalRead(DHT_PIN) == LOW) { if (--loopCnt == 0) { interrupts(); dhtFailStep = 4; return false; } }
+    uint16_t highCycles = 0;
+    loopCnt = 10000;
+    while (digitalRead(DHT_PIN) == HIGH) {
+      highCycles++;
+      if (--loopCnt == 0) { interrupts(); dhtFailStep = 4; return false; }
+    }
+
+    bits[i / 8] <<= 1;
+    if (highCycles > 15) {
+      bits[i / 8] |= 1;
+    }
+  }
+
+  interrupts();
+
+  // Verify checksum
+  uint8_t checksum = bits[0] + bits[1] + bits[2] + bits[3];
+  if ((checksum & 0xFF) != bits[4]) { dhtFailStep = 5; return false; }
+
+  memcpy(dhtData, bits, 5);
+  return true;
+}
 
 
 // Pin definitions
@@ -60,15 +112,23 @@ float tempMin = 999.0, tempMax = -999.0;
 float humMin = 999.0, humMax = -999.0;
 float freshUsedLiters = 0.0;
 float greyFilledLiters = 0.0;
-float prevFreshPercent = -1.0;
-float prevGreyPercent = -1.0;
+float anchorFreshPercent = -1.0;  // "confirmed" level - only moves on sustained change
+float anchorGreyPercent = -1.0;
 unsigned long statsStartTime = 0;
 uint8_t warmupCount = 0;
 #define WARMUP_READINGS 30  // Wait 30 seconds for smoothing to settle
 unsigned long lastSensorRead = 0;
-#define SENSOR_INTERVAL 1000
+#define SENSOR_INTERVAL 2500
 uint8_t refillConfirmCount = 0;
 #define REFILL_CONFIRM_SECS 10  // Must stay above 90% for 10 seconds
+
+// Robust usage tracking - require sustained change before counting
+#define USAGE_THRESHOLD_PCT 2.0    // Must change by 2% to count (= ~2.1L fresh, ~0.9L grey)
+#define USAGE_CONFIRM_COUNT 5      // Must stay at new level for 5 consecutive readings (~12.5s)
+float candidateFreshPercent = -1.0;
+float candidateGreyPercent = -1.0;
+uint8_t freshDropCount = 0;
+uint8_t greyRiseCount = 0;
 
 
 // Function declarations
@@ -105,18 +165,6 @@ float getWaterLevelPercent(float resistance) {
  if (resistance >= MAX_RESISTANCE) return 100.0;
   float percent = (resistance / MAX_RESISTANCE) * 100.0;
  return constrain(percent, 0, 100);
-}
-
-
-// Simplified - just return ADC value directly
-float readSensorADC(int pin) {
- // Take average of multiple readings for stability
- long sum = 0;
- for (int i = 0; i < 10; i++) {
-   sum += analogRead(pin);
-   delay(2);
- }
- return sum / 10.0;
 }
 
 
@@ -222,8 +270,12 @@ void resetStats() {
  humMin = 999.0; humMax = -999.0;
  freshUsedLiters = 0.0;
  greyFilledLiters = 0.0;
- prevFreshPercent = smoothedFreshWaterPercent;
- prevGreyPercent = smoothedGreyWaterPercent;
+ anchorFreshPercent = smoothedFreshWaterPercent;
+ anchorGreyPercent = smoothedGreyWaterPercent;
+ candidateFreshPercent = -1.0;
+ candidateGreyPercent = -1.0;
+ freshDropCount = 0;
+ greyRiseCount = 0;
  warmupCount = WARMUP_READINGS;  // Already warmed up after reset
  statsStartTime = millis();
 }
@@ -242,43 +294,98 @@ void updateStats() {
  // Wait for smoothing to converge before tracking water usage
  if (warmupCount < WARMUP_READINGS) {
    warmupCount++;
-   prevFreshPercent = smoothedFreshWaterPercent;
-   prevGreyPercent = smoothedGreyWaterPercent;
+   anchorFreshPercent = smoothedFreshWaterPercent;
+   anchorGreyPercent = smoothedGreyWaterPercent;
    return;
  }
 
- // Track water usage
- if (prevFreshPercent >= 0) {
-   // Auto-reset water stats when tank is refilled
-   // Must rise from below 70% to above 90% and stay there for 10 seconds
-   if (smoothedFreshWaterPercent >= 90.0 && prevFreshPercent < 70.0) {
-     refillConfirmCount = 1;  // Start confirming
-   }
-   if (refillConfirmCount > 0) {
-     if (smoothedFreshWaterPercent >= 90.0) {
-       refillConfirmCount++;
-       if (refillConfirmCount >= REFILL_CONFIRM_SECS) {
-         freshUsedLiters = 0.0;
-         greyFilledLiters = 0.0;
-         statsStartTime = millis();
-         refillConfirmCount = 0;
-       }
-     } else {
-       refillConfirmCount = 0;  // Dropped below 90%, cancel
-     }
-   }
+ if (anchorFreshPercent < 0) {
+   anchorFreshPercent = smoothedFreshWaterPercent;
+   anchorGreyPercent = smoothedGreyWaterPercent;
+   return;
+ }
 
-   float freshDelta = prevFreshPercent - smoothedFreshWaterPercent;
-   if (freshDelta > 0.5) {  // Only count decreases > 0.5% to avoid noise
-     freshUsedLiters += (freshDelta / 100.0) * FRESH_TANK_CAPACITY_L;
+ // Auto-reset water stats when tank is refilled
+ if (smoothedFreshWaterPercent >= 90.0 && anchorFreshPercent < 70.0) {
+   refillConfirmCount++;
+   if (refillConfirmCount >= REFILL_CONFIRM_SECS) {
+     freshUsedLiters = 0.0;
+     greyFilledLiters = 0.0;
+     anchorFreshPercent = smoothedFreshWaterPercent;
+     anchorGreyPercent = smoothedGreyWaterPercent;
+     candidateFreshPercent = -1.0;
+     candidateGreyPercent = -1.0;
+     freshDropCount = 0;
+     greyRiseCount = 0;
+     statsStartTime = millis();
+     refillConfirmCount = 0;
    }
-   float greyDelta = smoothedGreyWaterPercent - prevGreyPercent;
-   if (greyDelta > 0.5) {
-     greyFilledLiters += (greyDelta / 100.0) * GREY_TANK_CAPACITY_L;
+ } else {
+   refillConfirmCount = 0;
+ }
+
+ // FRESH water usage: only count when level drops by USAGE_THRESHOLD_PCT
+ // and stays there for USAGE_CONFIRM_COUNT consecutive readings
+ float freshDrop = anchorFreshPercent - smoothedFreshWaterPercent;
+ if (freshDrop >= USAGE_THRESHOLD_PCT) {
+   // Level is below anchor by threshold - start or continue confirming
+   if (candidateFreshPercent < 0) {
+     candidateFreshPercent = smoothedFreshWaterPercent;
+     freshDropCount = 1;
+   } else if (abs(smoothedFreshWaterPercent - candidateFreshPercent) < USAGE_THRESHOLD_PCT) {
+     // Still near candidate level
+     freshDropCount++;
+     candidateFreshPercent = smoothedFreshWaterPercent;  // Track latest
+   } else if (smoothedFreshWaterPercent < candidateFreshPercent) {
+     // Dropped even further - update candidate
+     candidateFreshPercent = smoothedFreshWaterPercent;
+     freshDropCount = 1;
+   }
+   if (freshDropCount >= USAGE_CONFIRM_COUNT) {
+     // Confirmed! Count the usage from anchor to current level
+     float confirmedDrop = anchorFreshPercent - smoothedFreshWaterPercent;
+     freshUsedLiters += (confirmedDrop / 100.0) * FRESH_TANK_CAPACITY_L;
+     anchorFreshPercent = smoothedFreshWaterPercent;
+     candidateFreshPercent = -1.0;
+     freshDropCount = 0;
+   }
+ } else {
+   // Level is near anchor (noise) - reset candidate
+   candidateFreshPercent = -1.0;
+   freshDropCount = 0;
+   // If level rose slightly above anchor (noise), move anchor up to avoid false triggers later
+   if (smoothedFreshWaterPercent > anchorFreshPercent + 0.5) {
+     anchorFreshPercent = smoothedFreshWaterPercent;
    }
  }
- prevFreshPercent = smoothedFreshWaterPercent;
- prevGreyPercent = smoothedGreyWaterPercent;
+
+ // GREY water tracking: only count when level rises by threshold and stays
+ float greyRise = smoothedGreyWaterPercent - anchorGreyPercent;
+ if (greyRise >= USAGE_THRESHOLD_PCT) {
+   if (candidateGreyPercent < 0) {
+     candidateGreyPercent = smoothedGreyWaterPercent;
+     greyRiseCount = 1;
+   } else if (abs(smoothedGreyWaterPercent - candidateGreyPercent) < USAGE_THRESHOLD_PCT) {
+     greyRiseCount++;
+     candidateGreyPercent = smoothedGreyWaterPercent;
+   } else if (smoothedGreyWaterPercent > candidateGreyPercent) {
+     candidateGreyPercent = smoothedGreyWaterPercent;
+     greyRiseCount = 1;
+   }
+   if (greyRiseCount >= USAGE_CONFIRM_COUNT) {
+     float confirmedRise = smoothedGreyWaterPercent - anchorGreyPercent;
+     greyFilledLiters += (confirmedRise / 100.0) * GREY_TANK_CAPACITY_L;
+     anchorGreyPercent = smoothedGreyWaterPercent;
+     candidateGreyPercent = -1.0;
+     greyRiseCount = 0;
+   }
+ } else {
+   candidateGreyPercent = -1.0;
+   greyRiseCount = 0;
+   if (smoothedGreyWaterPercent < anchorGreyPercent - 0.5) {
+     anchorGreyPercent = smoothedGreyWaterPercent;
+   }
+ }
 }
 
 void showResetAnimation() {
@@ -469,45 +576,30 @@ void drawCloud(int x, int y, int size) {
 
 // Animation when turning off display - clouds sweep across screen
 void showCloudSweepOff() {
- for (int frame = 0; frame < 30; frame++) {
+ for (int frame = 0; frame < 20; frame++) {
    u8g2.firstPage();
    do {
-     // Many clouds sweeping across from left to right
-     int baseX = frame * 7 - 80;
-    
-     // Row 1 - top
+     int baseX = frame * 10 - 80;
+
      drawCloud(baseX, 8, 5);
-     drawCloud(baseX + 35, 12, 4);
-     drawCloud(baseX + 70, 6, 6);
-     drawCloud(baseX + 100, 10, 3);
-    
-     // Row 2
-     drawCloud(baseX + 15, 22, 6);
-     drawCloud(baseX + 50, 18, 5);
-     drawCloud(baseX + 85, 24, 7);
-     drawCloud(baseX + 115, 20, 4);
-    
-     // Row 3 - middle
-     drawCloud(baseX + 5, 35, 7);
-     drawCloud(baseX + 40, 32, 5);
-     drawCloud(baseX + 75, 38, 6);
-     drawCloud(baseX + 105, 34, 5);
-    
-     // Row 4
-     drawCloud(baseX + 20, 48, 5);
-     drawCloud(baseX + 55, 52, 6);
-     drawCloud(baseX + 90, 46, 4);
-     drawCloud(baseX + 120, 50, 5);
-    
-     // Row 5 - bottom
-     drawCloud(baseX + 10, 60, 6);
-     drawCloud(baseX + 45, 58, 5);
-     drawCloud(baseX + 80, 62, 7);
-     drawCloud(baseX + 110, 56, 4);
-    
+     drawCloud(baseX + 45, 10, 4);
+     drawCloud(baseX + 90, 6, 6);
+
+     drawCloud(baseX + 15, 25, 6);
+     drawCloud(baseX + 60, 22, 5);
+     drawCloud(baseX + 105, 28, 7);
+
+     drawCloud(baseX + 5, 42, 7);
+     drawCloud(baseX + 50, 40, 5);
+     drawCloud(baseX + 95, 44, 6);
+
+     drawCloud(baseX + 20, 58, 5);
+     drawCloud(baseX + 65, 56, 6);
+     drawCloud(baseX + 110, 60, 5);
+
    } while (u8g2.nextPage());
   
-   delay(35);
+   delay(40);
  }
   // Clear display
  u8g2.firstPage();
@@ -516,51 +608,42 @@ void showCloudSweepOff() {
 
 
 void showStatsEntry() {
- // Easter egg animation when entering stats
  const char* phrases[] = {"Entering", "the void...", "Shhh...", "Sikret!"};
- for (int frame = 0; frame < 20; frame++) {
+ for (int frame = 0; frame < 12; frame++) {
    u8g2.firstPage();
    do {
-     int cloud1X = (frame * 3) % 150 - 20;
-     int cloud2X = ((frame * 2) + 60) % 160 - 30;
-     int cloud3X = ((frame * 4) + 100) % 170 - 40;
+     int cloud1X = (frame * 4) % 150 - 20;
+     int cloud2X = ((frame * 3) + 60) % 160 - 30;
      drawCloud(cloud1X, 12, 4);
      drawCloud(cloud2X, 8, 3);
-     drawCloud(cloud3X, 18, 5);
      u8g2.setFont(u8g2_font_8x13B_tf);
      u8g2.drawStr(28, 35, "Chmurka");
      u8g2.drawStr(28, 52, "Monitor");
      u8g2.setFont(u8g2_font_5x7_tf);
-     uint8_t idx = (frame / 5) % 4;
+     uint8_t idx = (frame / 3) % 4;
      u8g2.drawStr(28, 62, phrases[idx]);
    } while (u8g2.nextPage());
-   delay(100);
+   delay(120);
  }
 }
 
 
 void showSplash() {
- // Animated splash screen with moving clouds
- for (int frame = 0; frame < 20; frame++) {
+ for (int frame = 0; frame < 12; frame++) {
    u8g2.firstPage();
    do {
-     // Draw moving clouds
-     int cloud1X = (frame * 3) % 150 - 20;
-     int cloud2X = ((frame * 2) + 60) % 160 - 30;
-     int cloud3X = ((frame * 4) + 100) % 170 - 40;
-    
+     int cloud1X = (frame * 4) % 150 - 20;
+     int cloud2X = ((frame * 3) + 60) % 160 - 30;
+
      drawCloud(cloud1X, 12, 4);
      drawCloud(cloud2X, 8, 3);
-     drawCloud(cloud3X, 18, 5);
-    
-     // Main text
+
      u8g2.setFont(u8g2_font_8x13B_tf);
      u8g2.drawStr(28, 35, "Chmurka");
      u8g2.drawStr(28, 52, "Monitor");
     
-     // Loading dots animation
      u8g2.setFont(u8g2_font_5x7_tf);
-     char loadStr[16] = "Starting";
+     char loadStr[12] = "Starting";
      for (int i = 0; i < (frame % 4); i++) {
        strcat(loadStr, ".");
      }
@@ -568,7 +651,7 @@ void showSplash() {
     
    } while (u8g2.nextPage());
   
-   delay(100);
+   delay(150);
  }
 }
 
@@ -582,13 +665,19 @@ void setup() {
  showSplash();
  delay(2000);
  splashDone = true;
-  dht1.begin();
+  // DHT11 needs ~1s after power-on; splash already gave us plenty of time
+ pinMode(DHT_PIN, INPUT_PULLUP);
+ delay(1500);
  Wire.begin();
   pinMode(BUTTON_PIN, INPUT_PULLUP);
  pinMode(LED_BUILTIN, OUTPUT);
  digitalWrite(LED_BUILTIN, LOW);
 
  statsStartTime = millis();
+
+ // Quick pin diagnostic
+ Serial.print(F("DHT pin D2 state: "));
+ Serial.println(digitalRead(DHT_PIN) ? F("HIGH (OK)") : F("LOW (check wiring!)"));
  Serial.println(F("Chmurka monitor initialized"));
 }
 
@@ -600,9 +689,23 @@ void loop() {
  if (millis() - lastSensorRead < SENSOR_INTERVAL) return;
  lastSensorRead = millis();
 
+ // Read DHT22 with retries
+ temp1 = NAN;
+ humidity1 = NAN;
+ for (uint8_t attempt = 0; attempt < 3; attempt++) {
+   if (attempt > 0) delay(200);
+   bool ok = readDHT();
+   if (ok) {
+     // DHT22 format: 16-bit humidity, 16-bit temperature (bit 15 = sign)
+     humidity1 = ((uint16_t)dhtData[0] << 8 | dhtData[1]) * 0.1;
+     int16_t rawTemp = ((uint16_t)(dhtData[2] & 0x7F) << 8 | dhtData[3]);
+     temp1 = rawTemp * 0.1;
+     if (dhtData[2] & 0x80) temp1 = -temp1;  // negative temperature
+     break;
+   }
+ }
+
  currentVcc = readVcc();
- temp1 = dht1.readTemperature();
- humidity1 = dht1.readHumidity();
 
 
  // Read raw ADC values first for debugging
@@ -623,45 +726,20 @@ void loop() {
  updateStats();
 
  // Serial debug output
- Serial.println(F("=== SENSOR DEBUG ==="));
- Serial.print(F("VCC: ")); Serial.print(currentVcc); Serial.println(F(" mV"));
- Serial.print(F("FRESH - ADC: ")); Serial.print(freshRaw);
- Serial.print(F(" | Ohm: ")); Serial.print(freshResistance, 1);
- Serial.print(F(" | Level: ")); Serial.print(smoothedFreshWaterPercent, 0);
+ Serial.print(F("V:")); Serial.print(currentVcc);
+ Serial.print(F(" T:")); Serial.print(temp1);
+ Serial.print(F(" H:")); Serial.print(humidity1);
+ Serial.print(F(" DHT:")); Serial.print(dhtFailStep);
+ Serial.print(F(" D2:")); Serial.print(digitalRead(DHT_PIN));
+ Serial.print(F(" F:")); Serial.print(freshRaw);
+ Serial.print(F("/")); Serial.print(smoothedFreshWaterPercent, 0);
+ Serial.print(F("% G:")); Serial.print(greyRaw);
+ Serial.print(F("/")); Serial.print(smoothedGreyWaterPercent, 0);
  Serial.println(F("%"));
-  Serial.print(F("GREY  - ADC: ")); Serial.print(greyRaw);
- Serial.print(F(" | Ohm: ")); Serial.print(greyResistance, 1);
- Serial.print(F(" | Level: ")); Serial.print(smoothedGreyWaterPercent, 0);
- Serial.println(F("%"));
-  Serial.println();
 
 
  updateDisplay();
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
